@@ -224,29 +224,52 @@ struct Lower<'a> {
     abort: Option<usize>,
     /// A wave64 program run as 32-lane host waves (see [`Split`]).
     split: Option<Split>,
-    /// Split: the console lane (thread index in the group) and its half,
-    /// made in the entry block.
-    split_lane: Option<(V, V)>,
+    /// Split: the thread's flat id in the group, its console lane and the
+    /// lane's half, made in the entry block.
+    split_lane: Option<(V, V, V)>,
     /// Split: [`Atom::Any`] values by index, made where their branch is.
     anys: HashMap<u32, V>,
+    /// The thread's iterations of all its loops so far (see
+    /// [`TOTAL_LOOPS`]), a per-thread variable made on first use.
+    loop_total: Option<V>,
 }
 
-/// A wave64 compute program of at most 64 threads (one console wave per
-/// group) run as 32-lane host waves, from [`structure::structure_split`]:
-/// every lane follows the console wave's control flow, so every thread of
-/// the group reaches the points where its two halves meet, and a group
-/// barrier there is legal. The halves exchange values through dwords after
-/// the program's LDS ([`XCHG_DWORDS`] from `base`): a counter giving each
-/// host wave its half, the halves' ballots, and a dword per console lane.
-/// DPP, swizzles, `v_permlane*` and quad reads stay within a half: host lane
-/// n of half h is console lane 32h + n.
+/// Iterations of all loops together after which a thread stops, as a
+/// multiple of [`super::loop_limit`]: nested loops each under the limit
+/// multiply (a loop of 4096 inside one of 4096 is 16 million iterations a
+/// thread, which removed the device in Grand Theft Auto VI's hair
+/// simulation).
+const TOTAL_LOOPS: u32 = 4;
+
+/// A compute program lowered from [`structure::structure_split`]: every
+/// lane follows its console wave's control flow (branches on lane masks
+/// test whether some lane of the wave has them), with 32-lane host waves.
+///
+/// - A wave64 program of at most 64 threads (one console wave per group)
+///   runs as two host waves, its halves: every thread of the group reaches
+///   the points where they meet, so a group barrier there is legal. The
+///   halves exchange values through dwords after the program's LDS
+///   ([`XCHG_DWORDS`] from `base`): a counter giving each host wave its
+///   half, the halves' ballots, and a dword per console lane. DPP, swizzles,
+///   `v_permlane*` and quad reads stay within a half: host lane n of half h
+///   is console lane 32h + n.
+/// - A wave32 program (any group size) whose per-lane form does not lower
+///   (a lane mask read as data where some of its lanes are elsewhere): each
+///   host wave is one console wave, so nothing is exchanged; a lane mask is
+///   the wave's ballot wherever it is read.
 #[derive(Debug, Clone, Copy)]
 struct Split {
     /// First exchange dword.
     base: u32,
-    /// The group fills both halves (more than 32 threads); with one, its
-    /// host wave is the whole console wave and nothing is exchanged.
+    /// Two host waves make one console wave (a wave64 group of more than 32
+    /// threads); otherwise each host wave is a whole console wave and
+    /// nothing is exchanged.
     halves: bool,
+    /// The group holds more than one host wave: each takes its 32 thread ids
+    /// from the exchange counter (host waves need not hold consecutive ones).
+    counted: bool,
+    /// The console program's wave size is 64.
+    wave64: bool,
 }
 
 /// Exchange dwords: the half counter, two ballot words, two reduction
@@ -263,8 +286,15 @@ const XCHG_DWORDS: u32 = XCHG_LANES + 64;
 /// zeros) can make that four billion iterations, which hangs the host GPU
 /// until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+///
+/// 4096: in Grand Theft Auto VI's world, loops reading lists and counts
+/// that passes the host cannot run yet should have written run to this
+/// limit in every pixel or thread; at 2^20 they took 75-480 ms a draw (an
+/// RTX 5090) and nested ones removed the device, at 4096 the GPU's share
+/// of a frame went from 200-640 ms to 44-102 ms.
+// shortcut: a genuine loop of more iterations than this is cut short too
+// (its lane ends early); raise it once the passes such loops read run.
+pub(super) const LOOP_LIMIT: u32 = 1 << 12;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -442,9 +472,21 @@ impl<'a> Lower<'a> {
                     split = Some(Split {
                         base: s.lds_dwords,
                         halves: threads > 32,
+                        counted: threads > 32,
+                        wave64: true,
                     });
                     s.lds_dwords += XCHG_DWORDS;
                 }
+            }
+            if x.st.split && !x.native.wave64 && split.is_none() {
+                s.wave_size = Some(32);
+                split = Some(Split {
+                    base: s.lds_dwords,
+                    halves: false,
+                    counted: threads > 32,
+                    wave64: false,
+                });
+                s.lds_dwords += XCHG_DWORDS;
             }
         }
         let mut no_barrier = HashSet::new();
@@ -561,6 +603,7 @@ impl<'a> Lower<'a> {
             split,
             split_lane: None,
             anys: HashMap::new(),
+            loop_total: None,
         }
     }
 
@@ -2044,8 +2087,9 @@ impl<'a> Lower<'a> {
         }
         let [x, y, _] = self.s.threads.expect("compute");
         if self.split.is_some() {
-            // One console wave per group: the console lane is the flat id.
-            let f = self.split_lane().0;
+            // Each host wave holds the console wave of its 32 (or, in
+            // halves, 64) flat ids.
+            let f = self.split_ids().0;
             let e = self.s.entry;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
             return Val::I32(match c {
@@ -2162,6 +2206,13 @@ impl<'a> Lower<'a> {
     /// consecutive thread ids), and host lane n is console lane base + n.
     // shortcut: a partly filled host wave is taken to hold host lanes 0 up.
     fn split_lane(&mut self) -> (V, V) {
+        let (_, lane, half) = self.split_ids();
+        (lane, half)
+    }
+
+    /// Split: the thread's flat id in the group, its console lane and the
+    /// lane's half (see [`Self::split_lane`]).
+    fn split_ids(&mut self) -> (V, V, V) {
         if let Some(l) = self.split_lane {
             return l;
         }
@@ -2171,7 +2222,7 @@ impl<'a> Lower<'a> {
         let host = self
             .s
             .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let lane = if split.halves {
+        let flat = if split.counted {
             let counter = self.xchg(e, XCHG_COUNTER);
             let z = self.s.m.i32(0);
             self.s.m.store(e, counter, z);
@@ -2201,10 +2252,16 @@ impl<'a> Lower<'a> {
         } else {
             host
         };
-        let five = self.s.m.i32(5);
+        let (mask, five, one) = (
+            self.s.m.i32(if split.wave64 { 63 } else { 31 }),
+            self.s.m.i32(5),
+            self.s.m.i32(1),
+        );
+        let lane = self.s.m.bin(e, Bin::And, flat, mask);
         let half = self.s.m.bin(e, Bin::LShr, lane, five);
-        self.split_lane = Some((lane, half));
-        (lane, half)
+        let half = self.s.m.bin(e, Bin::And, half, one);
+        self.split_lane = Some((flat, lane, half));
+        (flat, lane, half)
     }
 
     /// Split: exchange dword `k` (a constant).
@@ -2259,8 +2316,9 @@ impl<'a> Lower<'a> {
     /// exchanged (as `v_readlane`, whatever EXEC holds).
     fn console_read(&mut self, x: V, index: V, at: usize) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let k63 = self.s.m.i32(63);
-        let index = self.s.m.bin(at, Bin::And, index, k63);
+        let split = self.split.expect("split");
+        let k = self.s.m.i32(if split.wave64 { 63 } else { 31 });
+        let index = self.s.m.bin(at, Bin::And, index, k);
         if !self.split.expect("split").halves {
             let i32t = self.s.t.i32;
             return self.s.op(
@@ -2343,6 +2401,28 @@ impl<'a> Lower<'a> {
             r = self.s.m.select(c, is, read, r);
         }
         r
+    }
+
+    /// Coarse gradients of `coords` across this lane's quad, as the console
+    /// takes them for implicit-level samples: x from lane 0 to 1, y from 0
+    /// to 2. Three x then three y components, unused ones undefined.
+    fn quad_gradients(&mut self, coords: &[V]) -> [V; 6] {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let mut g = [self.s.m.undef(f32t); 6];
+        for (k, &x) in coords.iter().enumerate().take(3) {
+            let mut q = [x; 3];
+            for (n, slot) in q.iter_mut().enumerate() {
+                let kn = self.s.m.i32(n as u32);
+                *slot = self
+                    .s
+                    .op(c, "quadReadLaneAt.f32", Attr::NoUnwind, f32t, 122, &[x, kn]);
+            }
+            g[k] = self.s.m.bin(c, Bin::Sub, q[1], q[0]);
+            g[3 + k] = self.s.m.bin(c, Bin::Sub, q[2], q[0]);
+        }
+        g
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -2609,6 +2689,18 @@ impl<'a> Lower<'a> {
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
         let r = match &inst.fields {
+            Fields::Sop { .. } if name == "s_getpc_b64" => {
+                // The address of the next instruction as the code's byte
+                // offset (code at address 0): addresses into the program's
+                // constant table that the code computes become offsets
+                // into it (see `code_dword`).
+                for (k, &(_, v)) in inst.writes.iter().enumerate() {
+                    let x = if k == 0 { offset as u32 + 4 } else { 0 };
+                    let x = self.s.m.i32(x);
+                    self.vals.insert(v, Val::I32(x));
+                }
+                Ok(())
+            }
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
@@ -3258,6 +3350,49 @@ impl<'a> Lower<'a> {
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
+    /// For a descriptor load no access uses: an access of a load of the
+    /// same entry, and the dword its descriptor starts at. Waterfall loops
+    /// load a lane's entry once to read its size and again for the access,
+    /// each time at an offset read from the first lane of the same VGPR
+    /// value.
+    fn same_entry_use(&self, site: Site) -> Option<(Site, u8)> {
+        let p = self.x.p;
+        let def = |v: Value| {
+            let &b = self.def_block.get(&v)?;
+            p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+        };
+        // A first-lane read stands for the value it reads.
+        let lane_value = |v: Value| match def(v) {
+            Some(i) if i.name() == "v_readfirstlane_b32" => i
+                .reads
+                .iter()
+                .find(|r| matches!(r.0, Reg::V(_)))
+                .map_or(v, |r| r.1),
+            _ => v,
+        };
+        let key = |a: Address| (a.param, a.offset, a.dynamic.map(lane_value));
+        let want = key(*self.scalar.get(&site)?);
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+            .find_map(|d| {
+                d.source.leaves().into_iter().find_map(|l| match *l {
+                    Source::Loaded { load, first }
+                        if load != site
+                            && self.scalar.get(&load).is_some_and(|&a| key(a) == want) =>
+                    {
+                        Some((d.site, first))
+                    }
+                    _ => None,
+                })
+            })
+    }
+
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -3287,7 +3422,8 @@ impl<'a> Lower<'a> {
                     Source::Loaded { load, first } if load == site => Some((d.site, first)),
                     _ => None,
                 })
-            });
+            })
+            .or_else(|| self.same_entry_use(site));
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -6291,9 +6427,26 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    if self.s.threads.is_some() && self.s.mesh.is_none() {
+                        // Compute: the gradients the console takes across
+                        // each quad of lanes (validator 1.6 refuses
+                        // implicit derivatives outside pixel shaders).
+                        let g = self.quad_gradients(&cs[..spatial]);
+                        args.extend(g);
+                        args.push(fu);
+                        self.s.op(
+                            c,
+                            "sampleGrad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            63,
+                            &args,
+                        )
+                    } else {
+                        args.push(fu);
+                        self.s
+                            .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    }
                 }
                 61 => {
                     let bias = addr_val(self, 0)?;
@@ -7189,7 +7342,30 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+        let this = self.s.m.cmp(c, p, next, limit);
+        // The thread's total over all loops, nested ones included.
+        let total = match self.loop_total {
+            Some(g) => g,
+            None => {
+                let z = self.s.m.i32(0);
+                let g = self.s.m.thread_global("loop_total", z);
+                self.loop_total = Some(g);
+                g
+            }
+        };
+        let sum = self.s.m.load(c, total);
+        let sum = self.s.m.bin(c, Bin::Add, sum, one);
+        self.s.m.store(c, total, sum);
+        let all = super::loop_limit().saturating_mul(TOTAL_LOOPS);
+        let all = self.s.m.i32(all);
+        // (A compare of its own each way: no `xor` of a compare in a loop
+        // exit, see `exit`.)
+        let total = self.s.m.cmp(c, p, sum, all);
+        if p == pred::IULT {
+            self.s.m.bin(c, Bin::And, this, total)
+        } else {
+            self.s.m.bin(c, Bin::Or, this, total)
+        }
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

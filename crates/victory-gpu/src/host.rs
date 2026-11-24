@@ -1380,21 +1380,91 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read. A whole 64 KiB block found
+    // unmapped into this destination is remembered ([`holes`]): its next
+    // copies skip the page by page tries (the copy already holds its zeros)
+    // after the one failed read of the block.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+        let whole_block = n == 64 << 10;
+        let key = (at, to as usize);
+        if read(at as *const u8, to, n) {
+            if whole_block {
+                holes().forget(key);
+            }
+            return;
+        }
+        if whole_block && holes().known(key) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            return;
+        }
+        let mut readable = false;
+        for_pieces(at, n, 4 << 10, |at, n| {
+            let to = dst.wrapping_add(at - src as usize);
+            if read(at as *const u8, to, n) {
+                readable = true;
+            } else {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                // SAFETY: inside the destination, which is mapped.
+                unsafe { to.write_bytes(0, n) };
+            }
+        });
+        if whole_block && !readable {
+            holes().remember(key);
         }
     });
+}
+
+/// Unmapped 64 KiB blocks of title memory, by (title address, destination
+/// address), whose copy holds zeros (see [`copy_mapped`]). Remapping title
+/// memory forgets the blocks in it ([`forget_holes`]); since titles can also
+/// commit memory without telling the runtime, all are forgotten every
+/// [`Holes::TTL`] too, and the page by page tries run again.
+struct Holes {
+    blocks: std::collections::HashSet<(usize, usize)>,
+    since: std::time::Instant,
+}
+
+impl Holes {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn known(&mut self, key: (usize, usize)) -> bool {
+        if self.since.elapsed() > Self::TTL {
+            self.blocks.clear();
+            self.since = std::time::Instant::now();
+        }
+        self.blocks.contains(&key)
+    }
+
+    fn remember(&mut self, key: (usize, usize)) {
+        self.blocks.insert(key);
+    }
+
+    fn forget(&mut self, key: (usize, usize)) {
+        self.blocks.remove(&key);
+    }
+}
+
+fn holes() -> std::sync::MutexGuard<'static, Holes> {
+    static HOLES: OnceLock<Mutex<Holes>> = OnceLock::new();
+    HOLES
+        .get_or_init(|| {
+            Mutex::new(Holes {
+                blocks: std::collections::HashSet::new(),
+                since: std::time::Instant::now(),
+            })
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: copies of
+/// it read it again page by page.
+pub(crate) fn forget_holes(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    holes().blocks.retain(|&(src, _)| src + (64 << 10) <= at || src >= end);
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not

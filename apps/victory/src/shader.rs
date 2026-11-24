@@ -105,6 +105,12 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 // `VICTORY_SHADER_HASH`: only the containers the runtime logs
                 // with these hashes (their BLAKE3's first hex digits, comma
                 // separated).
+                // `VICTORY_SHADER_NAME`: only records whose label holds it.
+                if let Ok(name) = std::env::var("VICTORY_SHADER_NAME")
+                    && !source.label().contains(name.as_str())
+                {
+                    continue;
+                }
                 if let Some(want) = &only {
                     let hex = blake3::hash(&bytes).to_hex();
                     if !want.iter().any(|h| hex.starts_with(h.as_str())) {

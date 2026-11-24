@@ -522,6 +522,66 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The high half written by the `s_getpc_b64` of every address `phi`
+    /// joins (through nested joins), if each is an address in the code's
+    /// table; `None` if any is another value.
+    fn code_join(&self, phi: Value) -> Option<Option<Value>> {
+        self.phis[phi.0 as usize]?;
+        let mut high = None;
+        let mut seen = vec![phi];
+        let mut todo = vec![phi];
+        while let Some(v) = todo.pop() {
+            let (b, i) = self.phis[v.0 as usize]?;
+            for &a in &self.p.blocks[b].phis[i].args {
+                let Term::Value(av) = self.origin(a) else {
+                    return None;
+                };
+                if self.phis[av.0 as usize].is_some() {
+                    if !seen.contains(&av) {
+                        seen.push(av);
+                        todo.push(av);
+                    }
+                    continue;
+                }
+                let pc = self.getpc(self.sum(Term::Value(av)).base?)?;
+                let h = pc.writes.get(1).map(|w| w.1);
+                if high.is_some_and(|x| x != h) {
+                    return None;
+                }
+                high = Some(h);
+            }
+        }
+        high
+    }
+
+    /// The high half `hi` of an address whose low half traced to a table in
+    /// the code, through a join (see [`Self::code_join`]): one of its
+    /// arguments is the `s_getpc_b64`'s high half (`high`).
+    fn code_phi_high(&self, hi: Term, high: Option<Value>) -> bool {
+        let Term::Value(v) = hi else { return false };
+        let Some((b, i)) = self.phis[v.0 as usize] else {
+            return false;
+        };
+        let mut seen = vec![v];
+        let mut todo = vec![(b, i)];
+        while let Some((b, i)) = todo.pop() {
+            for &a in &self.p.blocks[b].phis[i].args {
+                let t = self.origin(a);
+                if self.high_half(t, high) || high.is_some_and(|h| self.carried(t, h)) {
+                    return true;
+                }
+                if let Term::Value(av) = t
+                    && let Some(at) = self.phis[av.0 as usize]
+                    && !seen.contains(&av)
+                {
+                    seen.push(av);
+                    todo.push(at);
+                }
+            }
+        }
+        false
+    }
+
     /// The `s_getpc_b64` writing `lo` as its low dword.
     fn getpc(&self, lo: Value) -> Option<&'a Inst> {
         let inst = self.def(lo)?;
@@ -630,6 +690,23 @@ impl<'a> Tracer<'a> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
+        }
+        if s.base.is_none()
+            && extra.dynamic.is_none()
+            && let Some(phi) = s.dynamic
+            && let Some(high) = self.code_join(phi)
+        {
+            // A join of addresses in the code's table: the lowered
+            // `s_getpc_b64` yields the code offset it stands for, so the
+            // joined value is the byte offset in the code.
+            if !self.code_phi_high(hi, high) {
+                return Err("an address with an untracked high half");
+            }
+            return Ok(Address {
+                param: CODE,
+                offset: extra.offset,
+                dynamic: Some(phi),
+            });
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
@@ -1667,7 +1744,7 @@ impl Tracer<'_> {
 }
 
 /// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+pub(crate) fn lane_of(op: Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
@@ -1998,6 +2075,44 @@ pub(crate) mod tests {
                 what: "a descriptor changed after loading"
             }
         );
+    }
+
+    #[test]
+    fn joined_addresses_into_the_code_table_are_offsets_in_the_code() {
+        // Each side of a branch computes its own index into the table
+        // after the code; the load reads the join of the two addresses.
+        let r = track_words(
+            &[
+                0xBE86_1F00, // s_getpc_b64 s[6:7]
+                0x8006_FF06,
+                0x0000_0020, // s_add_u32 s6, s6, 0x20
+                0x8207_8007, // s_addc_u32 s7, s7, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0005, // s_cbranch_scc1 -> 0x2c
+                0xD70F_0401,
+                0x0000_0D00, // v_add_co_u32 v1, s4, v0, s6
+                0xD528_0402,
+                0x0010_0E80, // v_add_co_ci_u32 v2, s4, 0, s7, s4
+                0xBF82_0005, // s_branch -> 0x40
+                0x3406_0082, // 0x2c: v_lshlrev_b32 v3, 2, v0
+                0xD70F_0401,
+                0x0000_0D03, // v_add_co_u32 v1, s4, v3, s6
+                0xD528_0402,
+                0x0010_0E80, // v_add_co_ci_u32 v2, s4, 0, s7, s4
+                0xDC30_8000,
+                0x047D_0001, // 0x40: global_load_dword v4, v[1:2], off
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2)],
+            HwStage::Cs,
+        );
+        let (_, a) = r
+            .scalar
+            .iter()
+            .find(|(_, a)| a.param == CODE)
+            .unwrap_or_else(|| panic!("{:?}", r.scalar));
+        assert_eq!(a.offset, 0);
+        assert!(a.dynamic.is_some());
     }
 
     #[test]

@@ -66,6 +66,8 @@ struct Tally {
     cs_pipelines: usize,
     /// Wave64 compute programs retried as two 32-lane halves.
     split: usize,
+    /// Compute programs that emit only in the whole-wave form.
+    whole_wave: usize,
     /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
@@ -129,6 +131,7 @@ impl Tally {
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
         self.split += other.split;
+        self.whole_wave += other.whole_wave;
         self.ms_programs += other.ms_programs;
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
@@ -285,6 +288,10 @@ pub fn run(
         t.split
     );
     println!(
+        "             {} compute programs emitted in the whole-wave form only",
+        t.whole_wave
+    );
+    println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
@@ -327,9 +334,27 @@ fn translate(
     checks: &mut Checks,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
+    // `VICTORY_SHADER_NAME`: only records whose label holds it.
+    if let Ok(name) = std::env::var("VICTORY_SHADER_NAME")
+        && !source.label().contains(name.as_str())
+    {
+        return;
+    }
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    // `VICTORY_SHADER_HASH`: only the containers the runtime logs with
+    // these hashes (comma separated BLAKE3 prefixes), as in `shader-info`.
+    if let Ok(want) = std::env::var("VICTORY_SHADER_HASH") {
+        let hex = blake3::hash(&bytes).to_hex();
+        if !want
+            .split(',')
+            .map(str::trim)
+            .any(|h| !h.is_empty() && hex.starts_with(&h.to_ascii_lowercase()))
+        {
+            return;
+        }
+    }
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -409,29 +434,51 @@ fn translate(
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     let emitted = emit::emit(&container, &p, &program, &s, &i, &r);
-                    // As `emit::translate`: on a host without 64-lane waves,
-                    // a one-wave wave64 compute program runs split in two.
-                    let one_wave = p.stage == HwStage::Cs
+                    // As `emit::translate`: the whole-wave form for a wave64
+                    // program on a host without 64-lane waves, and for a
+                    // compute program whose per-lane form does not emit.
+                    let splits = p.stage == HwStage::Cs
                         && match &p.io {
                             victory_shader::native::StageIo::Cs(cs) => {
-                                cs.threads.iter().product::<u32>() <= 64
+                                !p.wave64 || cs.threads.iter().product::<u32>() <= 64
                             }
                             _ => false,
                         };
+                    let split_emit = || {
+                        structure::structure_split(&program).and_then(|st| {
+                            let r = resource::track(&program, &p.layout, p.stage, Some(&st))?;
+                            emit::emit(&container, &p, &program, &st, &i, &r)
+                        })
+                    };
                     let mut split = false;
                     let emitted = match emitted {
                         Ok(shader)
                             if emit::host_wave_lanes() < 64
                                 && shader.wave_size() == Some(64)
-                                && one_wave =>
+                                && splits =>
                         {
                             split = true;
                             t.split += 1;
-                            structure::structure_split(&program).and_then(|st| {
-                                let r = resource::track(&program, &p.layout, p.stage, Some(&st))?;
-                                emit::emit(&container, &p, &program, &st, &i, &r)
-                            })
+                            split_emit()
                         }
+                        Err(e) if splits => match split_emit() {
+                            Ok(shader) => {
+                                t.whole_wave += 1;
+                                Ok(shader)
+                            }
+                            Err(why) => {
+                                // `VICTORY_WHOLE_WAVE_WHY`: why the whole-wave
+                                // form does not emit either.
+                                if std::env::var_os("VICTORY_WHOLE_WAVE_WHY").is_some() {
+                                    let what = match &why {
+                                        ShaderError::Unsupported { what, .. } => what.to_string(),
+                                        w => w.to_string(),
+                                    };
+                                    t.fail(format!("whole-wave: {what}"), label);
+                                }
+                                Err(e)
+                            }
+                        },
                         other => other,
                     };
                     let step = if split { "split emit" } else { "emit" };

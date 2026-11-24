@@ -101,7 +101,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 4096.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
 /// The iteration count after which a translated loop is left, per lane and
@@ -256,19 +256,33 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    let shader = emit(&c, &native, &p, &st, &io, &res)?;
-    // A host without 64-lane waves refuses the wave64 form: one console
-    // wave per group runs as two 32-lane host waves instead.
-    let one_wave = match &native.io {
-        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>() <= 64,
-        _ => false,
-    };
-    if host_wave_lanes() < 64 && shader.wave_size() == Some(64) && one_wave {
+    let emitted = emit(&c, &native, &p, &st, &io, &res);
+    let split = || -> Result<HostShader, ShaderError> {
         let st = structure::structure_split(&p)?;
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-        return emit(&c, &native, &p, &st, &io, &res);
+        emit(&c, &native, &p, &st, &io, &res)
+    };
+    // The whole-wave form (`structure_split`): compute programs whose
+    // console wave fits a group's host waves (any wave32 program; a wave64
+    // one of at most 64 threads).
+    let splits = match &native.io {
+        crate::native::StageIo::Cs(cs) => {
+            !native.wave64 || cs.threads.iter().product::<u32>() <= 64
+        }
+        _ => false,
+    };
+    match emitted {
+        // A host without 64-lane waves refuses the wave64 form: one console
+        // wave per group runs as two 32-lane host waves instead.
+        Ok(shader) if host_wave_lanes() < 64 && shader.wave_size() == Some(64) && splits => {
+            split()
+        }
+        // The per-lane form stops at lane masks some of whose lanes are
+        // elsewhere (and the like); in the whole-wave form every lane is
+        // where the wave is. The first error stands if that fails too.
+        Err(e) if splits => split().map_err(|_| e),
+        other => other,
     }
-    Ok(shader)
 }
 
 /// Emits a program whose earlier stages already ran.

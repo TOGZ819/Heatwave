@@ -708,6 +708,16 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        if let Some(spilled) = self.restored_key(k) {
+            let (m, derived) = self.mask(spilled);
+            let cache = if derived {
+                &mut self.masks
+            } else {
+                &mut self.other
+            };
+            cache.insert(k, m);
+            return (m, derived);
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -742,6 +752,74 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The mask `k` restores when its dwords are `v_readlane_b32`s of the
+    /// lanes a mask was spilled to (`v_writelane_b32`): the spilled pair.
+    fn restored_key(&self, k: Key) -> Option<Key> {
+        let lo = self.restored(k.0)?;
+        let hi = if k.1 == k.0 { lo } else { self.restored(k.1)? };
+        Some((lo, hi))
+    }
+
+    /// For a `v_readlane_b32` of a constant lane: the SGPR value spilled
+    /// to that lane, found by following the VGPR's `v_writelane_b32` writes.
+    fn restored(&self, v: Value) -> Option<Value> {
+        let &(b, i) = self.defs.get(&v)?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_readlane_b32" {
+            return None;
+        }
+        let [Operand::Vector { reg, .. }, lane] = f.src[..] else {
+            return None;
+        };
+        let lane = crate::resource::lane_of(lane)?;
+        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
+            .ok()
+            .flatten()
+    }
+
+    /// The SGPR value lane `lane` of VGPR value `v` holds: `Ok(None)` for a
+    /// phi in `seen` (being resolved), `Err` if not a spilled SGPR.
+    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(m) = self.spilled(a, lane, seen)? {
+                    if found.is_some_and(|f| f != m) {
+                        return Err(());
+                    }
+                    found = Some(m);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        if crate::resource::lane_of(*at).ok_or(())? != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).map(Some),
+            _ => None,
+        }
+        .ok_or(())
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -956,7 +1034,9 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        let restored = self.restored_key(k).is_some();
+                        takes_mask |=
+                            self.masks.contains_key(&k) || (phi || restored) && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -1189,6 +1269,28 @@ mod tests {
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
         assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    #[test]
+    fn masks_spilled_to_vgpr_lanes_are_restored() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xD761_0001,
+                0x0001_066A, // v_writelane_b32 v1, vcc_lo, 3
+                0xD760_0004,
+                0x0001_0701, // v_readlane_b32 s4, v1, 3
+                0xD501_0002,
+                0x0011_0280, // v_cndmask_b32 v2, 0, 1, s4
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let restored = p.blocks[0].insts[2].write(Reg::S(4)).unwrap();
+        assert!(s.masks.contains_key(&cmp));
+        assert_eq!(s.masks.get(&restored), s.masks.get(&cmp));
     }
 
     #[test]

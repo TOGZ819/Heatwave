@@ -19,27 +19,29 @@ writes it so merges stay clean. The program, its commands and its
 **Tested on:** Windows 11, AMD Ryzen 7 9800X3D, NVIDIA RTX 5090 (driver
 610.88), 64 GB RAM.
 
-**What fails on this machine (2026-11-24):**
+**State on this machine (2026-11-24):**
 
-- Entering the world crashes after a few seconds at about 1 fps. One GPU
-  submission ran for 4.85 s, past Windows' GPU timeout (about 2 s), so the
-  device was removed (`0x887A0006`, `DXGI_ERROR_DEVICE_HUNG`).
-- 320 of the 1,441 compute shaders that translate are refused when their
-  pipelines are built (`0x80070057`), from
-  `victory translate shaders.rpf --pipelines`. All vertex/pixel (12,231) and
-  mesh (8,214) pipelines build. NVIDIA GPUs run only 32-lane waves in D3D12,
-  and VIctory asks for 64-lane waves (`WaveSize(64)`) for console wave64
-  programs that read other lanes. This is the likely cause; not yet confirmed
-  with the D3D12 debug layer.
-- Most of each world frame is spent copying title memory to the GPU and back
-  (130-340 ms copying 45-264 MB, plus 54-155 ms copying back), not on the GPU.
+- Entering the world reached the credits scene at 1-3 fps and crashed
+  there: GPU submissions ran past Windows' GPU timeout (about 2 s) and the
+  device was removed (`0x887A0006`). Shaders the translator cannot handle
+  drop their passes, later passes read what those would have written, and
+  loops in them ran to their limit.
+- Translated loops now stop after 4096 iterations (was 1,048,576), and each
+  thread after four times that over all its loops.
+- Console wave64 compute programs run as two 32-lane halves where NVIDIA's
+  32-lane waves cannot take them as they are.
+- `victory translate shaders.rpf --validate` with 32-lane host waves:
+  compute 2,077 of 2,606 emitted and validated (1,411 before these
+  changes), vertex/pixel 12,195 of 14,027, mesh 8,152 of 8,713. Of the 404
+  programs the credits scene could not use in the last run, 149 now
+  translate, among them about half of the per-material
+  `CS_RaytracingResolve` passes and the hair passes.
+- Copying title memory to the GPU and back still costs 100-370 ms per
+  world frame.
 
-**Planned:**
-
-1. Run console wave64 programs as two 32-lane halves on GPUs without 64-lane
-   waves.
-2. Make the title-memory copies faster, or share title memory with the GPU
-   without copies where that is faster on a discrete GPU.
+**Planned:** the remaining translation gaps of the credits scene
+(structured buffers of unknown stride, lane masks read as data), then the
+title-memory copies.
 
 **Credits.**
 
@@ -181,7 +183,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 4096 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
