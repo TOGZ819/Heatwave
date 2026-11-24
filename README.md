@@ -41,10 +41,22 @@ writes it so merges stay clean. The program, its commands and its
 2. Make the title-memory copies faster, or share title memory with the GPU
    without copies where that is faster on a discrete GPU.
 
-**Other projects.** [XCL](https://github.com/ivall/xcl) is used as a reference
-for how a running console title behaves. XCL is GPL-2.0-only, which cannot be
-combined with this GPL-3.0-or-later code, so no XCL code is copied here: only
-its documented findings inform independent implementations.
+**Credits.**
+
+- [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and its
+  contributors: all of the code this fork builds on.
+- [XCL](https://github.com/ivall/xcl) by ivall and its contributors: an Xbox
+  Series compatibility layer whose public documentation guides this fork's
+  plans, in particular
+  [docs/wave64-on-wave32.md](https://github.com/ivall/xcl/blob/main/docs/wave64-on-wave32.md)
+  (console wave64 programs on 32-lane GPUs), `crates/xcl/src/gpu/uma.rs`
+  (title memory shared with the GPU) and
+  [HANDOFF.md](https://github.com/ivall/xcl/blob/main/HANDOFF.md) (findings
+  from bringing up a retail title).
+
+XCL is GPL-2.0-only, which cannot be combined with this GPL-3.0-or-later
+code, so no XCL code is copied here: its documented findings inform
+independent implementations.
 
 **Your game files never go in this repository.** Keep them outside it, as
 VIctory's asset policy requires ([docs/asset-policy.md](docs/asset-policy.md)).
