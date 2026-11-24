@@ -522,6 +522,7 @@ fn place<'a>(
         size: 0,
         alignment: KIB_64,
     };
+    let mut placed = 0;
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
             tracing::warn!(?desc, "no size for this resource");
@@ -550,6 +551,13 @@ fn place<'a>(
         );
         total.size = offset + one.size;
         total.alignment = total.alignment.max(one.alignment);
+        placed = i + 1;
+    }
+    // Several resources are laid out as a C++ structure is (D3D12's
+    // documentation of GetResourceAllocationInfo): the size is padded to
+    // the largest alignment, so a heap sized from it ends on that boundary.
+    if placed > 1 {
+        total.size = total.size.next_multiple_of(total.alignment);
     }
     total
 }
@@ -1410,6 +1418,22 @@ mod tests {
     }
 
     #[test]
+    fn several_resources_pad_to_the_largest_alignment() {
+        let aligned = |alignment| ResourceDesc {
+            alignment,
+            ..buffer(KIB_64)
+        };
+        let mut offsets = Vec::new();
+        let descs = [aligned(0), aligned(MIB_4), aligned(0)];
+        let total = place(descs.iter(), |_, info| offsets.push(info.offset));
+        assert_eq!(offsets, [0, MIB_4, MIB_4 + KIB_64]);
+        assert_eq!((total.size, total.alignment), (2 * MIB_4, MIB_4));
+        // One resource keeps its own size.
+        let one = place([aligned(MIB_4)].iter(), |_, _| ());
+        assert_eq!((one.size, one.alignment), (KIB_64, MIB_4));
+    }
+
+    #[test]
     fn heaps_are_zeroed_aligned_memory() {
         let heap = heap(1 << 20);
         // SAFETY: a heap we just made.
@@ -1552,7 +1576,8 @@ mod tests {
         assert_eq!(
             info,
             AllocationInfo {
-                size: KIB_64 + size(&descs[1]).unwrap(),
+        // Padded to the largest alignment, as for several resources.
+                size: (KIB_64 + size(&descs[1]).unwrap()).next_multiple_of(KIB_64),
                 alignment: KIB_64
             }
         );
