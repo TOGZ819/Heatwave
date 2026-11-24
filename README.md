@@ -1,12 +1,57 @@
-# VIctory
+# Heatwave
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+Heatwave is a fork of [VIctory](https://github.com/Marvisak/VIctory), which
+runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows from files the
+user supplies. This fork tracks VIctory's `main` and works on getting the game
+world to render on NVIDIA GPUs.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
+
+## This fork
+
+Everything below this section is VIctory's own README, kept as upstream
+writes it so merges stay clean. The program, its commands and its
+`VICTORY_*` variables keep VIctory's names.
+
+**Tested on:** Windows 11, AMD Ryzen 7 9800X3D, NVIDIA RTX 5090 (driver
+610.88), 64 GB RAM.
+
+**What fails on this machine (2026-11-24):**
+
+- Entering the world crashes after a few seconds at about 1 fps. One GPU
+  submission ran for 4.85 s, past Windows' GPU timeout (about 2 s), so the
+  device was removed (`0x887A0006`, `DXGI_ERROR_DEVICE_HUNG`).
+- 320 of the 1,441 compute shaders that translate are refused when their
+  pipelines are built (`0x80070057`), from
+  `victory translate shaders.rpf --pipelines`. All vertex/pixel (12,231) and
+  mesh (8,214) pipelines build. NVIDIA GPUs run only 32-lane waves in D3D12,
+  and VIctory asks for 64-lane waves (`WaveSize(64)`) for console wave64
+  programs that read other lanes. This is the likely cause; not yet confirmed
+  with the D3D12 debug layer.
+- Most of each world frame is spent copying title memory to the GPU and back
+  (130-340 ms copying 45-264 MB, plus 54-155 ms copying back), not on the GPU.
+
+**Planned:**
+
+1. Run console wave64 programs as two 32-lane halves on GPUs without 64-lane
+   waves.
+2. Make the title-memory copies faster, or share title memory with the GPU
+   without copies where that is faster on a discrete GPU.
+
+**Other projects.** [XCL](https://github.com/ivall/xcl) is used as a reference
+for how a running console title behaves. XCL is GPL-2.0-only, which cannot be
+combined with this GPL-3.0-or-later code, so no XCL code is copied here: only
+its documented findings inform independent implementations.
+
+**Your game files never go in this repository.** Keep them outside it, as
+VIctory's asset policy requires ([docs/asset-policy.md](docs/asset-policy.md)).
+
+---
+
+# VIctory
 
 ## Status (2026-11-23)
 
