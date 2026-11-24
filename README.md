@@ -1,3 +1,31 @@
+# Heatwave
+
+Heatwave continues [victory-fork](https://github.com/fxceless/victory-fork)
+by fxceless, itself a fork of [VIctory](https://github.com/Marvisak/VIctory)
+by Marvisak. It tracks victory-fork and VIctory and keeps developing on top of
+them. All of the code here at the start of Heatwave's history is theirs;
+their history is kept intact.
+
+**Credits.**
+
+- [victory-fork](https://github.com/fxceless/victory-fork) by fxceless and
+  its contributors: the base of this repository (rendering, speed and
+  stability work for the title's world). GPL-3.0-or-later.
+- [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and its
+  contributors: the loader, runtime services, Direct3D 12 back end and
+  shader recompiler everything builds on. GPL-3.0-or-later.
+- [XCL](https://github.com/ivall/xcl) by ivall and its contributors
+  (GPL-2.0-only): used for ideas only; no XCL code is copied here.
+- Heatwave's earlier, separate line of work (wave64 programs split into
+  32-lane halves, loop budgets, shader translation fixes) is kept on the
+  [`heatwave-v1`](https://github.com/TOGZ819/Heatwave/tree/heatwave-v1)
+  branch.
+
+Licence: GPL-3.0-or-later, as the projects it builds on. **No game files are
+in this repository**; you need your own copy of the game.
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
