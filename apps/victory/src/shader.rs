@@ -73,6 +73,12 @@ struct Totals {
 
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let only: Option<Vec<String>> = std::env::var("VICTORY_SHADER_HASH").ok().map(|v| {
+        v.split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
     let mut t = Totals::default();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -96,6 +102,15 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     eprintln!("corrupt record {}{}", path.display(), source.label());
                     continue;
                 };
+                // `VICTORY_SHADER_HASH`: only the containers the runtime logs
+                // with these hashes (their BLAKE3's first hex digits, comma
+                // separated).
+                if let Some(want) = &only {
+                    let hex = blake3::hash(&bytes).to_hex();
+                    if !want.iter().any(|h| hex.starts_with(h.as_str())) {
+                        continue;
+                    }
+                }
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
