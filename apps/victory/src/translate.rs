@@ -64,6 +64,8 @@ struct Tally {
     cs_emitted: usize,
     cs_validated: usize,
     cs_pipelines: usize,
+    /// Wave64 compute programs retried as two 32-lane halves.
+    split: usize,
     /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
@@ -126,6 +128,7 @@ impl Tally {
         self.cs_emitted += other.cs_emitted;
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
+        self.split += other.split;
         self.ms_programs += other.ms_programs;
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
@@ -170,8 +173,19 @@ pub fn run(
         );
     }
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        // Translate for this GPU's waves (wave64 programs split on 32).
+        emit::set_host_wave_lanes(host.wave_lanes().1);
     }
+    // `VICTORY_HOST_WAVE_LANES`: translate as for a host with waves of at
+    // most that many lanes (32: as on NVIDIA), without building pipelines.
+    if let Some(n) = std::env::var("VICTORY_HOST_WAVE_LANES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+    {
+        emit::set_host_wave_lanes(n);
+    }
+    println!("host waves   up to {} lanes", emit::host_wave_lanes());
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -265,6 +279,10 @@ pub fn run(
     println!(
         "             {} emitted of {} compute programs; {} validated, {} pipelines",
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
+    );
+    println!(
+        "             {} wave64 compute programs split for 32-lane waves",
+        t.split
     );
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
@@ -390,16 +408,53 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    let emitted = emit::emit(&container, &p, &program, &s, &i, &r);
+                    // As `emit::translate`: on a host without 64-lane waves,
+                    // a one-wave wave64 compute program runs split in two.
+                    let one_wave = p.stage == HwStage::Cs
+                        && match &p.io {
+                            victory_shader::native::StageIo::Cs(cs) => {
+                                cs.threads.iter().product::<u32>() <= 64
+                            }
+                            _ => false,
+                        };
+                    let mut split = false;
+                    let emitted = match emitted {
+                        Ok(shader)
+                            if emit::host_wave_lanes() < 64
+                                && shader.wave_size() == Some(64)
+                                && one_wave =>
+                        {
+                            split = true;
+                            t.split += 1;
+                            structure::structure_split(&program).and_then(|st| {
+                                let r = resource::track(&program, &p.layout, p.stage, Some(&st))?;
+                                emit::emit(&container, &p, &program, &st, &i, &r)
+                            })
+                        }
+                        other => other,
+                    };
+                    let step = if split { "split emit" } else { "emit" };
+                    match emitted {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            let ops = lane_ops(&program, &s);
+                            // `VICTORY_WAVE64_CENSUS`: list every compute
+                            // program that needs 64-lane waves by kind.
+                            if shader.wave_size() == Some(64)
+                                && std::env::var_os("VICTORY_WAVE64_CENSUS").is_some()
+                            {
+                                let kind =
+                                    format!("wave64 census:{}{ops}", wave_and_group(&shader));
+                                t.fail(kind, label);
+                            }
+                            check(shader, t, checks, label, &ops);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
+                            .fail(format!("{step}: {what}"), || {
                                 format!("{} at {offset:#x}", label())
                             }),
-                        Err(e) => t.fail(format!("emit: {e}"), label),
+                        Err(e) => t.fail(format!("{step}: {e}"), label),
                     }
                 }
             }
@@ -414,12 +469,77 @@ fn translate(
     }
 }
 
+/// The kinds of cross-lane machine instruction a program uses (and LDS),
+/// as a failure label suffix: what a wave64 program on a 32-lane host
+/// would need exchanged between its halves.
+fn lane_ops(program: &ir::Program, s: &structure::Structured) -> String {
+    let mut kinds = std::collections::BTreeSet::new();
+    for i in program.blocks.iter().flat_map(|b| &b.insts) {
+        let n = i.name();
+        let kind = if matches!(&i.fields, victory_shader::gfx10::Fields::Valu(v) if v.dpp.is_some())
+        {
+            "dpp"
+        } else if n.starts_with("ds_swizzle") {
+            "swizzle"
+        } else if n.contains("permlane") {
+            "permlane"
+        } else if n.contains("permute") {
+            "bpermute"
+        } else if n.starts_with("v_mbcnt") {
+            "mbcnt"
+        } else if n == "v_readfirstlane_b32" {
+            "readfirstlane"
+        } else if matches!(n, "v_readlane_b32" | "v_writelane_b32") {
+            "readlane"
+        } else if n.starts_with("ds_") {
+            "lds"
+        } else {
+            continue;
+        };
+        kinds.insert(kind);
+    }
+    let list: Vec<&str> = kinds.into_iter().collect();
+    // Whether every branch is the same in all lanes (over uniform atoms
+    // only): then every lane reaches every block, and group barriers are
+    // legal anywhere outside a guard.
+    let divergent = s.exits.iter().any(|e| match *e {
+        LaneExit::Branch { when, .. } => !s
+            .bools
+            .support(when)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(_))),
+        _ => false,
+    });
+    let flow = if divergent { "divergent" } else { "uniform" };
+    format!(" {{{}}} {flow}", list.join("+"))
+}
+
+/// The wave size a compute shader asks for and its group size, from its
+/// PSV0 part, as a failure label suffix: refusals of wave64 programs on a
+/// host whose waves are 32 lanes then count apart. Empty for other stages.
+fn wave_and_group(shader: &emit::HostShader) -> String {
+    if shader.stage != HwStage::Cs {
+        return String::new();
+    }
+    let wave = match shader.wave_size() {
+        None => "any wave".to_owned(),
+        Some(n) => format!("wave{n}"),
+    };
+    let group = match shader.group_threads() {
+        0..=32 => "<=32",
+        33..=64 => "33-64",
+        _ => ">64",
+    };
+    format!(" [{wave}, {group} threads]")
+}
+
 /// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
+    ops: &str,
 ) {
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
@@ -451,7 +571,17 @@ fn check(
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
-            Err(e) => t.fail(format!("pipeline: {e}"), &label),
+            Err(e) => {
+                let ops = if shader.wave_size().is_some() {
+                    ops
+                } else {
+                    ""
+                };
+                t.fail(
+                    format!("pipeline: {e}{}{ops}", wave_and_group(&shader)),
+                    &label,
+                );
+            }
         }
     }
     let Some(v) = checks.validator.as_mut() else {

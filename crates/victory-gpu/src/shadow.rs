@@ -99,6 +99,18 @@ impl Shadow {
         address - self.start
     }
 
+    /// The title memory it copies: (start, length).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn range(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
+    /// Its memory is write-watched (an update copies only written pages).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn watched(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == 1
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -375,6 +387,14 @@ static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new(
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Every copy made so far, of buffers and of memory outside them.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn all() -> Vec<Arc<Shadow>> {
+    let mut out: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    out.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    out
 }
 
 /// A title buffer exists at `start` (`len` bytes).

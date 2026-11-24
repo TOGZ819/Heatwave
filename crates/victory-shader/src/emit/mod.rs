@@ -84,6 +84,8 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod split_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -120,6 +122,25 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// The most lanes a host wave can have, as the host device reports it
+/// (`WaveLaneCountMax`); 64 until told. Below 64 (NVIDIA GPUs run 32),
+/// [`translate`] runs wave64 compute programs that need 64-lane waves as two
+/// 32-lane halves where it can. The translation depends on it, so the shader
+/// cache must key on it (`victory-gpu`'s does).
+static HOST_WAVE_LANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
+
+/// Sets [`host_wave_lanes`]: the host device's `WaveLaneCountMax` (0 when
+/// unknown counts as 64).
+pub fn set_host_wave_lanes(max: u32) {
+    let max = if max == 0 { 64 } else { max };
+    HOST_WAVE_LANES.store(max, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_host_wave_lanes`].
+pub fn host_wave_lanes() -> u32 {
+    HOST_WAVE_LANES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -170,6 +191,30 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// The wave size the shader requires (its PSV0 minimum), `None` when
+    /// it runs at any: a host whose waves are another size refuses it.
+    pub fn wave_size(&self) -> Option<u32> {
+        self.psv0_u32(16).filter(|&n| n != 0)
+    }
+
+    /// Threads per group (x · y · z, from PSV0); 0 outside compute.
+    pub fn group_threads(&self) -> u32 {
+        (36..48)
+            .step_by(4)
+            .map(|o| self.psv0_u32(o).unwrap_or(0))
+            .product()
+    }
+
+    /// The dword at `offset` of PSV0's runtime info (after its size dword).
+    fn psv0_u32(&self, offset: usize) -> Option<u32> {
+        let c = crate::Container::parse(&self.dxil).ok()?;
+        let info = c
+            .part(crate::FourCC::PSV0)?
+            .data
+            .get(4 + offset..8 + offset)?;
+        Some(u32::from_le_bytes(info.try_into().ok()?))
+    }
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -211,7 +256,19 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    let shader = emit(&c, &native, &p, &st, &io, &res)?;
+    // A host without 64-lane waves refuses the wave64 form: one console
+    // wave per group runs as two 32-lane host waves instead.
+    let one_wave = match &native.io {
+        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>() <= 64,
+        _ => false,
+    };
+    if host_wave_lanes() < 64 && shader.wave_size() == Some(64) && one_wave {
+        let st = structure::structure_split(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        return emit(&c, &native, &p, &st, &io, &res);
+    }
+    Ok(shader)
 }
 
 /// Emits a program whose earlier stages already ran.

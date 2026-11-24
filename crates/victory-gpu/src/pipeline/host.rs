@@ -435,7 +435,20 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    let wave = stages
+                        .first()
+                        .and_then(|(s, _)| s.translated())
+                        .and_then(|t| t.host.wave_size());
+                    let (_, max) = host.wave_lanes();
+                    if let Some(n) = wave.filter(|&n| max != 0 && n > max) {
+                        tracing::warn!(
+                            error = %e,
+                            ?shaders,
+                            "host pipeline refused: the program needs {n}-lane waves, this GPU runs at most {max}"
+                        );
+                    } else {
+                        tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    }
                     host.log_messages();
                     return None;
                 }

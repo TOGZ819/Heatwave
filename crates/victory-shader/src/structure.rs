@@ -50,6 +50,11 @@ pub enum Atom {
     Opaque(Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
+    /// Split wave64 ([`structure_split`]): some lane of the console wave
+    /// holds [`Structured::anys`]`[n]`'s condition where that block ends.
+    /// The same in every lane, so a branch on it keeps the console wave's
+    /// control flow.
+    Any(u32),
 }
 
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
@@ -353,6 +358,12 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// [`Atom::Any`] `n`: the block at whose end it is taken and the
+    /// per-lane condition some lane must hold.
+    pub anys: Vec<(usize, Bool)>,
+    /// Made by [`structure_split`]: every lane of the console wave reaches
+    /// every block the wave does (EXEC only guards).
+    pub split: bool,
 }
 
 impl Structured {
@@ -367,7 +378,21 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
+    structure_with(program, false)
+}
+
+/// [`structure`] for a wave64 program run as two 32-lane host waves: a
+/// branch on a lane mask becomes a branch on whether some lane of the
+/// console wave has it ([`Atom::Any`]), so every lane follows the console
+/// wave's control flow and EXEC is left to the guards. Every lane then
+/// reaches every point where the two halves exchange values.
+pub fn structure_split(program: &Program) -> Result<Structured, ShaderError> {
+    structure_with(program, true)
+}
+
+fn structure_with(program: &Program, split: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.split = split;
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -413,6 +438,10 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// [`structure_split`]'s mode.
+    split: bool,
+    /// See [`Structured::anys`].
+    anys: Vec<(usize, Bool)>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -476,6 +505,8 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            split: false,
+            anys: Vec::new(),
         })
     }
 
@@ -488,6 +519,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.anys.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -539,7 +571,7 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                self.when[b] = Some(self.branch(last, b));
             }
         }
         execs
@@ -638,6 +670,8 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            anys: self.anys,
+            split: self.split,
         })
     }
 
@@ -1001,23 +1035,20 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// The per-lane condition under which a block's closing branch is taken.
-    fn branch(&mut self, inst: &Inst) -> Bool {
+    /// The per-lane condition under which the closing branch of block `b`
+    /// is taken.
+    fn branch(&mut self, inst: &Inst, b: usize) -> Bool {
         let exec = self.exec(inst);
-        match inst.name() {
-            "s_cbranch_execz" => self.b.not(exec),
-            "s_cbranch_execnz" => exec,
+        // The lanes whose bit the branch tests ("some lane is set"), and
+        // whether it is taken when some lane is.
+        let (set, when_set) = match inst.name() {
+            n @ ("s_cbranch_execz" | "s_cbranch_execnz") => (exec, n.ends_with("nz")),
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
-                if n.ends_with("nz") {
-                    any
-                } else {
-                    self.b.not(any)
-                }
+                (self.b.and(vcc, exec), n.ends_with("nz"))
             }
             n => {
                 let Some(scc) = inst.read(Reg::Scc) else {
@@ -1030,13 +1061,29 @@ impl<'a> Lanes<'a> {
                         self.b.atom(Atom::Uniform(scc), born)
                     }
                 };
-                if n == "s_cbranch_scc1" {
-                    set
-                } else {
-                    self.b.not(set)
-                }
+                (set, n == "s_cbranch_scc1")
             }
+        };
+        let set = if self.split { self.any(set, b) } else { set };
+        if when_set { set } else { self.b.not(set) }
+    }
+
+    /// Split mode: whether some lane of the console wave holds `set` at the
+    /// end of block `b`, as an [`Atom::Any`]; `set` itself when it is
+    /// already the same in every lane.
+    fn any(&mut self, set: Bool, b: usize) -> Bool {
+        let uniform = self
+            .b
+            .support(set)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(_) | Atom::Any(_)));
+        if uniform {
+            return set;
         }
+        let n = self.anys.len() as u32;
+        self.anys.push((b, set));
+        let born = self.index[b];
+        self.b.atom(Atom::Any(n), born)
     }
 
     /// What a lane knows on entering each block, to a fixpoint. A loop

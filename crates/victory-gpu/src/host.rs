@@ -122,7 +122,12 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            // Translations follow the host's waves (wave64 programs split
+            // into two 32-lane halves where it has none of 64).
+            victory_shader::emit::set_host_wave_lanes(host.wave_lanes().1);
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -336,6 +341,20 @@ pub(crate) fn dred_on() -> bool {
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// `VICTORY_COPY_ALL=<MiB>`: copies of title buffers of at most that size
+/// (64 MiB for any other value) are all brought up to date at every
+/// submission. Big buffers are left out: whole, they cost seconds a frame.
+#[cfg(feature = "diagnostics")]
+fn copy_all() -> Option<u64> {
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_COPY_ALL").ok()?;
+        let mib = value.trim().parse::<u64>().ok().filter(|&m| m > 1).unwrap_or(64);
+        tracing::warn!(mib, "VICTORY_COPY_ALL: title buffers up to this size copied at every submission");
+        Some(mib << 20)
+    })
+}
+
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -449,6 +468,33 @@ impl Host {
         })
     }
 
+    /// The host's wave sizes, (fewest, most) lanes; logged once. NVIDIA
+    /// GPUs run 32 lanes only, so console wave64 programs that need 64-lane
+    /// waves are refused there.
+    pub(crate) fn wave_lanes(&self) -> (u32, u32) {
+        static LANES: OnceLock<(u32, u32)> = OnceLock::new();
+        *LANES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes the structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let lanes = if ok {
+                (options.WaveLaneCountMin, options.WaveLaneCountMax)
+            } else {
+                (0, 0)
+            };
+            tracing::info!(min = lanes.0, max = lanes.1, "host wave lanes");
+            lanes
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -508,6 +554,19 @@ impl Host {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+        }
+        // Diagnostics (`VICTORY_COPY_ALL`): every title buffer's copy brought
+        // up to date (its written pages), not only the ranges draws are known
+        // to read: shows whether stale copies are what a frame reads.
+        #[cfg(feature = "diagnostics")]
+        if let Some(limit) = copy_all() {
+            for s in crate::shadow::all() {
+                let (start, len) = s.range();
+                // Only watched memory: the rest is copied whole each time.
+                if len <= limit && s.watched() {
+                    batch.add(&s, start as usize, len as usize);
+                }
+            }
         }
         batch.flush();
         let prepared = std::time::Instant::now();
